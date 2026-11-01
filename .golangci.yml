@@ -1,0 +1,38 @@
+version: "2"
+
+linters:
+  enable:
+    - bodyclose  # HTTP レスポンスの Body の閉じ忘れを検出する
+    - dupl       # 重複したコード片を検出する
+    - gocritic   # バグの可能性、性能、コーディングスタイルの問題を検出する
+    - gosec      # ソースコード内のセキュリティ上の問題を検出する
+    - makezero   # append 前提のスライスを長さ 0 以外で初期化する誤りを検出する
+    - misspell   # コメントなどに含まれる英単語のよくあるスペルミスを検出する
+    - noctx      # HTTP リクエストなどで context.Context を使わない呼び出しを検出する
+    - prealloc   # スライスの容量を事前に確保できる箇所を検出する
+    - revive     # 命名やコメントなど、Go のコーディング規約に関する問題を検出する
+    - unparam    # 使用されていない関数パラメータを検出する
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+
+formatters:
+  enable:
+    - gofmt      # Go 標準の書式に合わせてコードを整形する
+    - goimports  # コードを整形し、import の追加・削除・並び替えを行う
+
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
