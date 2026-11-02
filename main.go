@@ -7,6 +7,7 @@ import (
 	"go/ast"
 	"go/format"
 	"go/parser"
+	"go/printer"
 	"go/scanner"
 	"go/token"
 	"io"
@@ -161,7 +162,7 @@ func inspectDir(w io.Writer, root, dir string) error {
 					// 二重表示を防ぐ
 					copyDecl.Doc = nil
 
-					printNode(w, fset, &copyDecl)
+					printNode(w, fset, &copyDecl, declarationComments(file.Comments, d, []*ast.BlockStmt{d.Body}))
 
 				case *ast.GenDecl:
 					printDoc(w, d.Doc, true)
@@ -171,28 +172,12 @@ func inspectDir(w io.Writer, root, dir string) error {
 						copyDecl := *d
 						copyDecl.Doc = nil
 
+						var omitted []*ast.BlockStmt
 						if d.Tok == token.VAR {
-							copyDecl.Specs = make([]ast.Spec, len(d.Specs))
-
-							for i, spec := range d.Specs {
-								vs, ok := spec.(*ast.ValueSpec)
-								if !ok {
-									copyDecl.Specs[i] = spec
-									continue
-								}
-
-								copySpec := *vs
-								copySpec.Values = make([]ast.Expr, len(vs.Values))
-
-								for j, value := range vs.Values {
-									copySpec.Values[j] = stripFuncBody(value)
-								}
-
-								copyDecl.Specs[i] = &copySpec
-							}
+							copyDecl.Specs = stripVarBodies(d.Specs, &omitted)
 						}
 
-						printNode(w, fset, &copyDecl)
+						printNode(w, fset, &copyDecl, declarationComments(file.Comments, d, omitted))
 					}
 				}
 			}
@@ -202,24 +187,51 @@ func inspectDir(w io.Writer, root, dir string) error {
 	return nil
 }
 
-func stripFuncBody(expr ast.Expr) ast.Expr {
+// stripVarBodies は元のASTを変更せず、変数の無名関数本体を省く。
+func stripVarBodies(specs []ast.Spec, omitted *[]*ast.BlockStmt) []ast.Spec {
+	result := make([]ast.Spec, len(specs))
+
+	for i, spec := range specs {
+		vs, ok := spec.(*ast.ValueSpec)
+		if !ok {
+			result[i] = spec
+			continue
+		}
+
+		copySpec := *vs
+		// 初期値がない宣言はnilのままにし、余分な「=」を出さない。
+		if vs.Values != nil {
+			copySpec.Values = make([]ast.Expr, len(vs.Values))
+			for j, value := range vs.Values {
+				copySpec.Values[j] = stripFuncBody(value, omitted)
+			}
+		}
+
+		result[i] = &copySpec
+	}
+
+	return result
+}
+
+func stripFuncBody(expr ast.Expr, omitted *[]*ast.BlockStmt) ast.Expr {
 	switch e := expr.(type) {
 	case *ast.FuncLit:
+		*omitted = append(*omitted, e.Body)
 		return e.Type
 
 	case *ast.CallExpr:
 		copyExpr := *e
-		copyExpr.Fun = stripFuncBody(e.Fun)
+		copyExpr.Fun = stripFuncBody(e.Fun, omitted)
 		copyExpr.Args = make([]ast.Expr, len(e.Args))
 
 		for i, arg := range e.Args {
-			copyExpr.Args[i] = stripFuncBody(arg)
+			copyExpr.Args[i] = stripFuncBody(arg, omitted)
 		}
 		return &copyExpr
 
 	case *ast.ParenExpr:
 		copyExpr := *e
-		copyExpr.X = stripFuncBody(e.X)
+		copyExpr.X = stripFuncBody(e.X, omitted)
 		return &copyExpr
 
 	case *ast.CompositeLit:
@@ -227,23 +239,67 @@ func stripFuncBody(expr ast.Expr) ast.Expr {
 		copyExpr.Elts = make([]ast.Expr, len(e.Elts))
 
 		for i, elt := range e.Elts {
-			copyExpr.Elts[i] = stripFuncBody(elt)
+			copyExpr.Elts[i] = stripFuncBody(elt, omitted)
 		}
 		return &copyExpr
 
 	case *ast.KeyValueExpr:
 		copyExpr := *e
-		copyExpr.Value = stripFuncBody(e.Value)
+		copyExpr.Value = stripFuncBody(e.Value, omitted)
 		return &copyExpr
 	}
 
 	return expr
 }
 
-func printNode(w io.Writer, fset *token.FileSet, node ast.Node) {
+// declarationComments は宣言内のコメントを残し、省略した本体内のものだけ除く。
+func declarationComments(groups []*ast.CommentGroup, decl ast.Node, omitted []*ast.BlockStmt) []*ast.CommentGroup {
+	var result []*ast.CommentGroup
+
+	// ValueSpecなどに付いた行末コメントは宣言のEndより後にも存在する。
+	trailing := make(map[*ast.Comment]bool)
+	ast.Inspect(decl, func(node ast.Node) bool {
+		group, ok := node.(*ast.CommentGroup)
+		if ok && group.Pos() >= decl.End() {
+			for _, comment := range group.List {
+				trailing[comment] = true
+			}
+		}
+		return true
+	})
+
+	for _, group := range groups {
+		var comments []*ast.Comment
+		for _, comment := range group.List {
+			if comment.Pos() < decl.Pos() || (comment.End() > decl.End() && !trailing[comment]) {
+				continue
+			}
+
+			hidden := false
+			for _, body := range omitted {
+				if body != nil && comment.Pos() >= body.Pos() && comment.End() <= body.End() {
+					hidden = true
+					break
+				}
+			}
+
+			if !hidden {
+				comments = append(comments, comment)
+			}
+		}
+
+		if len(comments) > 0 {
+			result = append(result, &ast.CommentGroup{List: comments})
+		}
+	}
+
+	return result
+}
+
+func printNode(w io.Writer, fset *token.FileSet, node ast.Node, comments []*ast.CommentGroup) {
 	var buf bytes.Buffer
 
-	if err := format.Node(&buf, fset, node); err != nil {
+	if err := format.Node(&buf, fset, &printer.CommentedNode{Node: node, Comments: comments}); err != nil {
 		fmt.Fprintf(w, "    <format error: %v>\n", err)
 		return
 	}
@@ -301,7 +357,10 @@ func printDoc(w io.Writer, doc *ast.CommentGroup, indent bool) {
 		indentSpace = "    "
 	}
 
-	for _, line := range strings.Split(strings.TrimSpace(doc.Text()), "\n") {
-		fmt.Fprintf(w, "%s%s// %s%s\n", indentSpace, colorDim, line, colorReset)
+	// Text()はgo:embedなどのディレクティブを除去するため、元のコメントを使う。
+	for _, comment := range doc.List {
+		for _, line := range strings.Split(comment.Text, "\n") {
+			fmt.Fprintf(w, "%s%s%s%s\n", indentSpace, colorDim, line, colorReset)
+		}
 	}
 }
